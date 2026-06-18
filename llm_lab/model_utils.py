@@ -1,8 +1,3 @@
-"""
-Shared utilities for loading models consistently across the project.
-Handles device selection, dtype, and warmup so every script starts
-from a known-good warm state.
-"""
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -18,7 +13,9 @@ def get_device() -> torch.device:
 def load_model(model_name: str, dtype=torch.float16):
     device = get_device()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(
+        device
+    )
     model.eval()
     return model, tokenizer, device
 
