@@ -5,13 +5,13 @@ from transformers import LogitsProcessorList
 from rich.console import Console
 from rich.rule import Rule
 
-from llm_lab.model_utils import load_and_warm
-from llm_lab.entropy_tracker import (
+from utils.model_utils import load_and_warm
+from entropy_tracker.entropy_tracker import (
     EntropyLogitsProcessor,
     attach_chosen_tokens,
     summarize,
 )
-from summary_stats.render import replay, print_summary
+from entropy_tracker.renderer import replay, print_summary
 
 MODEL = "Qwen/Qwen2.5-3B-Instruct"
 MAX_NEW_TOKENS = 250
@@ -62,4 +62,4 @@ def main(prompt: str):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "Continue this story in exactly 3 sentences: She opened the envelope and laughed, then cried, then laughed again.")
+    main(sys.argv[1] if len(sys.argv) > 1 else "LLMs are trained via web crawled novel data, but as we tend to put out more ai generated output, isnt there a paradoxical claim of having something similar to the dead internet theory but in this case the model training on its own data, and wont that cause bias eventually since it's training on its own output?")
