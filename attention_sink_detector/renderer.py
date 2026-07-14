@@ -10,8 +10,8 @@ from transformers import PreTrainedTokenizerBase
 
 from .attention_sink import TokenAttentionRecord
 
-_STRUCTURAL_STYLE = "bold white on grey37"   # expected (e.g. BOS) — muted, not alarming
-_SINK_STYLE = "bold white on red3"            # anomalous — the actually interesting finding
+_STRUCTURAL_STYLE = "bold white on grey37"  # expected (e.g. BOS) — muted, not alarming
+_SINK_STYLE = "bold white on red3"  # anomalous — the actually interesting finding
 _NORMAL_STYLE = "grey70"
 
 
@@ -50,24 +50,30 @@ def print_health_summary(
 ) -> None:
     color = "green3" if health >= 7 else "yellow3" if health >= 4 else "red3"
     console.print(
-        Panel.fit(Text(f"{health:.1f}/10", style=f"bold {color}"), title="Context health")
+        Panel.fit(
+            Text(f"{health:.1f}/10", style=f"bold {color}"), title="Context health"
+        )
     )
 
-    structural = [r for r in records if r.is_structural]
+    structural_records = [r for r in records if r.is_structural]
     anomalous = [r for r in records if r.is_sink and not r.is_structural]
 
-    if structural:
-        table = Table(title="Structural sinks (expected, excluded from score)")
+    if structural_records:
+        table = Table(
+            title="Structural positions (template-fixed, excluded from baseline)"
+        )
         table.add_column("Position")
         table.add_column("Token")
         table.add_column("Mean attn.")
         table.add_column("Z-score")
-        for r in structural:
+        table.add_column("Sink?")
+        for r in structural_records:
             table.add_row(
                 str(r.position),
                 repr(tokenizer.decode([r.token_id])),
                 f"{r.mean_attention:.4f}",
                 f"{r.z_score:.2f}",
+                "[bold]yes[/bold]" if r.is_sink else "no",
             )
         console.print(table)
         console.print()

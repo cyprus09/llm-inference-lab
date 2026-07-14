@@ -26,6 +26,9 @@ def main(prompt: str):
 
     console.print(Rule("Analyzing prefill"))
     records = analyze_prefill(model, tokenizer, inputs["input_ids"])
+    for r in records:
+        if r.position in (2, 278):
+            print(r.position, r.token_id, r.is_structural, r.z_score)
     health = context_health_score(records)
 
     highlight_prompt(records, tokenizer, console)

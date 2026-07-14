@@ -60,28 +60,43 @@ def mean_attention_received(attn_matrix: torch.Tensor) -> torch.Tensor:
 
 def detect_sinks(
     mean_attn: torch.Tensor,
-    threshold: float = 2.0,
+    threshold: float = 6.0,  # see rationale below
     exclude_positions: Tuple[int, ...] = (0,),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """z-score sink detection. Position 0 (BOS) is excluded from the
-    population mean/std by default — it's a structural sink (every query
-    can see it; it has no preceding context to compete with), and its
-    outsized share otherwise compresses z-scores for genuinely anomalous
-    sinks elsewhere. It's still flagged as a sink, just not used to
-    calibrate the baseline."""
+    """Robust sink detection via median/MAD in log-space.
+
+    Attention mass is strictly positive and right-skewed (most tokens get
+    near-zero, a few get more) — it is NOT approximately normal. A raw
+    mean/std z-score under-penalizes the skew and flags ordinary
+    high-attention content words (topically salient tokens, section
+    markers) as if they were sinks. Two fixes:
+      1. log-transform before computing spread, since attention ratios
+         behave closer to log-normal than normal.
+      2. use median/MAD instead of mean/std, since MAD is not itself
+         dragged upward by the same skew it's trying to measure.
+    """
     mask = torch.ones_like(mean_attn, dtype=torch.bool)
     for p in exclude_positions:
         if 0 <= p < len(mask):
             mask[p] = False
 
     population = mean_attn[mask]
-    mu, sigma = population.mean(), population.std()
-    z = torch.zeros_like(mean_attn) if sigma.item() < 1e-8 else (mean_attn - mu) / sigma
+    log_population = torch.log(population.clamp_min(1e-8))
+    log_all = torch.log(mean_attn.clamp_min(1e-8))
+
+    median = log_population.median()
+    mad = (log_population - median).abs().median()
+    scaled_mad = (
+        mad * 1.4826
+    )  # makes MAD ≈ std under normality, for comparable thresholds
+
+    z = (
+        torch.zeros_like(mean_attn)
+        if scaled_mad.item() < 1e-8
+        else (log_all - median) / scaled_mad
+    )
 
     is_sink = z > threshold
-    for p in exclude_positions:
-        if 0 <= p < len(is_sink):
-            is_sink[p] = True
     return is_sink, z
 
 
@@ -101,11 +116,9 @@ def find_structural_positions(input_ids: torch.Tensor, tokenizer) -> set[int]:
         if tid in special_ids:
             structural.add(i)
         if i > 0 and ids[i - 1] in (im_start_id, im_end_id):
-            # token right after <|im_start|> (role name) or <|im_end|> (newline)
-            structural.add(i)
-            # one more lookahead: the newline that follows the role name itself
-            if i + 1 < len(ids):
-                structural.add(i + 1)
+            structural.add(i)  # role name (after im_start) or newline (after im_end)
+            if ids[i - 1] == im_start_id and i + 1 < len(ids):
+                structural.add(i + 1)  # newline after the role name specifically
     return structural
 
 
