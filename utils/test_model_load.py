@@ -2,9 +2,7 @@ import torch
 import time
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
-
+from utils.constants import DRAFT_MODEL, MODEL as VERIFIER_MODEL
 
 def get_device():
     if torch.backends.mps.is_available():
@@ -19,13 +17,13 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
-    print(f"Loading tokenizer for {MODEL_NAME}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    print(f"Loading tokenizer for {DRAFT_MODEL}...")
+    tokenizer = AutoTokenizer.from_pretrained(DRAFT_MODEL)
 
     print(f"Loading model...")
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, dtype=torch.float16, device_map=None
+        DRAFT_MODEL, dtype=torch.float16, device_map=None
     ).to(device)
     print(f"Model loaded in {time.time() - t0:.1f}s")
 

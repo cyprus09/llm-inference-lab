@@ -7,8 +7,7 @@ from utils.model_utils import load_and_warm
 from .attention_sink import analyze_prefill, context_health_score
 from .renderer import highlight_prompt, print_health_summary
 
-MODEL = "Qwen/Qwen2.5-3B-Instruct"
-ATTN_IMPL = "eager"
+from utils.constants import MODEL, ATTN_IMPL
 
 
 def main(prompt: str):
