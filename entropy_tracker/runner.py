@@ -13,9 +13,7 @@ from entropy_tracker.entropy_tracker import (
 )
 from entropy_tracker.renderer import replay, print_summary
 
-MODEL = "Qwen/Qwen2.5-3B-Instruct"
-MAX_NEW_TOKENS = 250
-
+from utils.constants import MODEL, MAX_NEW_TOKENS
 
 def main(prompt: str):
     console = Console()
@@ -62,4 +60,8 @@ def main(prompt: str):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "LLMs are trained via web crawled novel data, but as we tend to put out more ai generated output, isnt there a paradoxical claim of having something similar to the dead internet theory but in this case the model training on its own data, and wont that cause bias eventually since it's training on its own output?")
+    main(
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "LLMs are trained via web crawled novel data, but as we tend to put out more ai generated output, isnt there a paradoxical claim of having something similar to the dead internet theory but in this case the model training on its own data, and wont that cause bias eventually since it's training on its own output?"
+    )

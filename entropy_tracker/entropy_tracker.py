@@ -18,6 +18,18 @@ class StepRecord:
     chosen_token_id: Optional[int] = None  # attached after generation
 
 
+def compute_entropy(scores: torch.FloatTensor) -> Tuple[float, float]:
+    """Compute (raw_entropy_nats, normalized_entropy) from a single step's logits.
+    scores: shape [vocab_size], unbatched, un-normalized logits.
+    """
+    vocab_size = scores.shape[-1]
+    log_probs = F.log_softmax(scores.float(), dim=-1)
+    probs = log_probs.exp()
+    entropy = -(probs * log_probs).sum().item()
+    normalized_entropy = entropy / math.log(vocab_size)
+    return entropy, normalized_entropy
+
+
 class EntropyLogitsProcessor(LogitsProcessor):
     """Observes (never modifies) logits at each decode step. batch_size=1 only."""
 
@@ -33,17 +45,14 @@ class EntropyLogitsProcessor(LogitsProcessor):
     def __call__(
         self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     ) -> torch.FloatTensor:
-        vocab_size = scores.shape[-1]
-        # float32 avoids fp16 underflow; log_softmax+exp more stable than softmax().log()
-        log_probs = F.log_softmax(scores[0].float(), dim=-1)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).sum().item()
+        entropy, normalized_entropy = compute_entropy(scores[0])
+        probs = F.log_softmax(scores[0].float(), dim=-1).exp()
         top_probs, top_indices = torch.topk(probs, k=self.top_k)
         self.records.append(
             StepRecord(
                 step=self._step,
                 entropy=entropy,
-                normalized_entropy=entropy / math.log(vocab_size),
+                normalized_entropy=normalized_entropy,
                 top_k=list(zip(top_indices.tolist(), top_probs.tolist())),
             )
         )
