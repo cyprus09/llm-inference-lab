@@ -1,26 +1,33 @@
 import sys
 import time
-import torch
-from transformers import LogitsProcessorList
+
 from rich.console import Console
 from rich.rule import Rule
 
-from utils.model_utils import load_and_warm
-from entropy_tracker.entropy_tracker import (
-    EntropyLogitsProcessor,
-    attach_chosen_tokens,
-    summarize,
-)
-from entropy_tracker.renderer import replay, print_summary
+from utils.model_utils import load_and_warm, assert_tokenizer_compatible
+from utils.constants import DRAFT_MODEL, MODEL as VERIFIER_MODEL, MAX_NEW_TOKENS
 
-from utils.constants import MODEL, MAX_NEW_TOKENS
+from speculative_decoding.generate import generate
+from speculative_decoding.renderer import replay, print_summary
+
+
+def setup_models():
+    draft_model, draft_tokenizer, draft_device = load_and_warm(DRAFT_MODEL)
+    verifier_model, verifier_tokenizer, verifier_device = load_and_warm(VERIFIER_MODEL)
+
+    assert_tokenizer_compatible(draft_tokenizer, verifier_tokenizer)
+    assert (
+        draft_device == verifier_device
+    ), "Draft and verifier must be on the same device"
+
+    return draft_model, verifier_model, draft_tokenizer, draft_device
 
 
 def main(prompt: str):
     console = Console()
 
     console.print(Rule("Loading"))
-    model, tokenizer, device = load_and_warm(MODEL)
+    draft_model, verifier_model, tokenizer, device = setup_models()
 
     input_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
@@ -30,34 +37,23 @@ def main(prompt: str):
     ).to(device)
     prompt_len = input_ids["input_ids"].shape[1]
 
-    processor = EntropyLogitsProcessor()
-
-    console.print(Rule("Generating"))
+    console.print(Rule("Generating (sampling-mode speculative decoding)"))
     t0 = time.time()
-    with torch.no_grad():
-        output = model.generate(
-            **input_ids,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            logits_processor=LogitsProcessorList([processor]),
-            pad_token_id=tokenizer.eos_token_id,
-        )
-    n_new = output.shape[1] - prompt_len
-    console.print(f"{n_new} tokens in {time.time() - t0:.1f}s\n")
-
-    attach_chosen_tokens(processor.records, output[0], prompt_len)
-
-    console.print(
-        Rule(
-            "[green3]■[/green3] confident  [yellow3]■[/yellow3] uncertain  [red3]■[/red3] very uncertain"
-        )
+    output_ids, stats = generate(
+        draft_model,
+        verifier_model,
+        input_ids["input_ids"],
+        max_new_tokens=MAX_NEW_TOKENS,
+        eos_token_id=tokenizer.eos_token_id,
     )
-    replay(processor.records, tokenizer, console)
+    elapsed = time.time() - t0
+    n_new = output_ids.shape[1] - prompt_len
+    console.print(f"{n_new} tokens in {elapsed:.1f}s\n")
+
+    replay(stats, output_ids[0, prompt_len:].tolist(), tokenizer, console)
 
     console.print(Rule("Summary"))
-    print_summary(summarize(processor.records, tokenizer), console)
+    print_summary(stats, elapsed, console)
 
 
 if __name__ == "__main__":

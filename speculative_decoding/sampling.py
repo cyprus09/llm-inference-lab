@@ -25,13 +25,15 @@ def top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
 
 def sample_token(
     logits: torch.Tensor, temperature: float, top_p: float
-) -> tuple[int, float]:
+) -> tuple[int, float, torch.Tensor]:
     """Sample one token from a single step's logits. Returns (token_id, its probability
-    under this same filtered distribution) since accept/reject needs p_draft(x) for that
-    exact token under the same sampling procedure that produced it.
+    under this same filtered distribution, and the full filtered distribution itself)
+    since accept/reject needs the draft's full per-token distribution -- not just
+    p_draft(x) for the sampled token -- to compute the residual max(0, p_verify - p_draft)
+    correctly across the whole vocab.
     logits: [vocab_size], unbatched, un-normalized.
     """
     probs = F.softmax(logits.float() / temperature, dim=-1)
     probs = top_p_filter(probs, top_p)
     token_id = torch.multinomial(probs, num_samples=1).item()
-    return token_id, probs[token_id].item()
+    return token_id, probs[token_id].item(), probs

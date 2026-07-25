@@ -8,3 +8,4 @@ ATTN_IMPL = "eager"
 GAMMA = 4  # number of draft tokens proposed per verification round
 TEMPERATURE = 0.7
 TOP_P = 0.9
+ENTROPY_STOP_THRESHOLD = 0.5  # matches entropy_tracker's "red" (very uncertain) bucket

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 import torch
 import torch.nn.functional as F
+from transformers.cache_utils import Cache
 
+from utils.constants import ENTROPY_STOP_THRESHOLD, GAMMA, TEMPERATURE, TOP_P
+
+from entropy_tracker.entropy_tracker import compute_entropy
 from speculative_decoding.sampling import sample_token, top_p_filter
 
-from utils.constants import GAMMA, TEMPERATURE, TOP_P
 
 # Draft proposal length per round. Sampling-mode speculative decoding
 # guarantees output == verifier's own sampling distribution only when
-# both draft and verifier sample stochastically -- see sampling.py for the
-# shared temperature/top_p that both sides use.
+# both draft and verifier sample stochastically (see sampling.py for the shared temperature/top_p that both sides use.)
 
 
 @dataclass
@@ -22,8 +24,14 @@ class RoundResult:
     bonus_token: (
         int  # either the verifier's correction, or an extra verifier-sampled token
     )
-    num_proposed: int  # gamma, for acceptance-rate bookkeeping
+    num_proposed: int  # actual proposed count this round, for acceptance-rate bookkeeping
     num_accepted: int  # len(accepted_tokens)
+    entropy_trace: List[float] = field(default_factory=list)  # draft's normalized entropy per proposed position
+    requested_gamma: int = 0  # gamma asked for this round, before any entropy-based early stop
+
+    @property
+    def stopped_early_on_entropy(self) -> bool:
+        return self.num_proposed < self.requested_gamma
 
 
 @torch.no_grad()
@@ -33,52 +41,73 @@ def draft_step(
     gamma: int = GAMMA,
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
-) -> tuple[torch.Tensor, List[float]]:
-    """Autoregressively sample gamma tokens from the draft model using KV cache.
-    One full forward pass to build the cache, then gamma incremental passes (one per new token),
-    each processing only the last token with position IDs to maintain absolute position awareness.
-    Returns (draft_ids [1, gamma], p_draft per sampled token).
+    cache: Cache | None = None,
+    entropy_stop_threshold: float = ENTROPY_STOP_THRESHOLD,
+) -> tuple[torch.Tensor, List[float], List[torch.Tensor], List[float], Cache]:
+    """Autoregressively sample up to gamma tokens from the draft model using KV cache.
+    `cache` holds prior rounds' state (already covering everything up to input_ids[:, -1]);
+    when None this is the first round and a full prefill builds it. Every subsequent round
+    only needs input_ids[:, -1:] since the rest is already cached from generate.py's bookkeeping.
+
+    Stops proposing early (before gamma) if the draft's own normalized entropy at a position
+    is >= entropy_stop_threshold: a draft token the draft itself is very unsure about is likely
+    to be rejected anyway, so continuing to propose further tokens conditioned on it tends to be
+    wasted work. Always proposes at least one token per round.
+
+    Returns (draft_ids [1, <=gamma], p_draft per sampled token, the full filtered draft
+    distribution per proposed position (needed for a correct residual on rejection),
+    the draft's normalized entropy per proposed position (for correlating against
+    acceptance in Phase 4), updated cache covering the full prefix + all proposed tokens,
+    caller must crop it back if any are rejected).
     """
     device = input_ids.device
     draft_probs: List[float] = []
+    draft_dists: List[torch.Tensor] = []
     draft_ids_list: List[int] = []
+    entropy_trace: List[float] = []
 
-    # Initial full forward pass to build KV cache
     prefix_len = input_ids.shape[1]
-    output = draft_model(input_ids, use_cache=True)
+
+    if cache is None:
+        # First round ever: no cache exists yet, prefill the whole prompt
+        output = draft_model(input_ids, use_cache=True)
+    else:
+        # Cache already covers input_ids[:, :-1]; extend it with just the newest token
+        output = draft_model(input_ids[:, -1:], past_key_values=cache, use_cache=True)
+
+    assert output.past_key_values is not None
     cache = output.past_key_values
 
-    # Sample gamma tokens autoregressively with cache reuse
+    # Sample up to gamma tokens autoregressively with cache reuse
     for i in range(gamma):
         # Current position in the sequence: where the next token will be predicted
         current_pos = prefix_len + i
 
-        # Only pass the last token (the one we just sampled) with its position ID
         if i == 0:
-            # First token: use the last token of input_ids
-            model_input = input_ids[:, -1:]
-            position_ids = torch.tensor([[current_pos - 1]], device=device, dtype=torch.long)
+            logits = output.logits[0, -1]
         else:
-            # Subsequent tokens: use the token we just sampled
             model_input = torch.tensor(
                 [[draft_ids_list[-1]]], device=device, dtype=torch.long
             )
             position_ids = torch.tensor([[current_pos - 1]], device=device, dtype=torch.long)
+            output = draft_model(
+                model_input, past_key_values=cache, position_ids=position_ids, use_cache=True
+            )
+            cache = output.past_key_values
+            logits = output.logits[0, -1]
 
-        # Incremental forward with explicit position_ids
-        output = draft_model(
-            model_input, past_key_values=cache, position_ids=position_ids, use_cache=True
-        )
-        cache = output.past_key_values
+        _, normalized_entropy = compute_entropy(logits)
+        if i > 0 and normalized_entropy >= entropy_stop_threshold:
+            break
 
-        # Sample from the logits of this new position
-        logits = output.logits[0, -1]
-        token_id, p = sample_token(logits, temperature, top_p)
+        token_id, p, dist = sample_token(logits, temperature, top_p)
         draft_ids_list.append(token_id)
         draft_probs.append(p)
+        draft_dists.append(dist)
+        entropy_trace.append(normalized_entropy)
 
     draft_ids = torch.tensor([draft_ids_list], device=device, dtype=torch.long)
-    return draft_ids, draft_probs
+    return draft_ids, draft_probs, draft_dists, entropy_trace, cache
 
 
 @torch.no_grad()
@@ -87,24 +116,44 @@ def verify_and_accept(
     input_ids: torch.Tensor,
     draft_ids: torch.Tensor,
     draft_probs: List[float],
+    draft_dists: List[torch.Tensor],
+    entropy_trace: List[float],
+    requested_gamma: int,
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
-) -> RoundResult:
-    """Single batched forward pass over [prefix + draft tokens], then sampling-mode
-    accept/reject: accept token i with probability min(1, p_verify(x_i)/p_draft(x_i));
-    on first rejection, resample from the residual max(0, p_verify - p_draft) and stop.
-    If all gamma tokens are accepted, sample one bonus token from the verifier's next
-    position for free (the whole point of speculative decoding: gamma+1 tokens for the
-    cost of one verifier forward pass when acceptance is perfect).
+    cache: Cache | None = None,
+) -> tuple[RoundResult, Cache]:
+    """Single batched forward pass over [last accepted token + draft tokens], reusing
+    `cache` (already covering input_ids[:, :-1]) so the verifier never re-prefills the
+    whole generated sequence. Then sampling-mode accept/reject: accept token i with
+    probability min(1, p_verify(x_i)/p_draft(x_i)); on first rejection, resample from
+    the residual max(0, p_verify - p_draft) and stop. If all gamma tokens are accepted,
+    sample one bonus token from the verifier's next position for free (the whole point
+    of speculative decoding: gamma+1 tokens for the cost of one verifier forward pass
+    when acceptance is perfect).
+
+    Returns (result, cache) where cache covers input_ids + all gamma draft tokens --
+    caller must crop it back to the accepted length before the next round.
     """
     gamma = draft_ids.shape[1]
-    full_ids = torch.cat([input_ids, draft_ids], dim=1)
-    logits = verifier_model(full_ids).logits[0]  # [seq_len, vocab]
-    prefix_len = input_ids.shape[1]
+    if cache is None:
+        # First round ever: no cache exists yet, prefill the whole prompt + draft tokens
+        new_ids = torch.cat([input_ids, draft_ids], dim=1)
+    else:
+        # Cache already covers input_ids[:, :-1]; extend it with the newest token + draft tokens
+        new_ids = torch.cat([input_ids[:, -1:], draft_ids], dim=1)
+    output = verifier_model(new_ids, past_key_values=cache, use_cache=True)
+    # Only the last gamma+1 positions matter: logits[-(gamma+1)] predicts the first
+    # draft token, ..., logits[-1] predicts the free bonus token. On round 1, new_ids
+    # includes the full prompt, so the score positions must be taken from the tail,
+    # not from index 0.
+    logits = output.logits[0, -(gamma + 1):]  # [gamma + 1, vocab], logits[i] predicts draft_ids[i] (i<gamma) or bonus (i==gamma)
+    assert output.past_key_values is not None
+    cache = output.past_key_values
 
     accepted: List[int] = []
     for i in range(gamma):
-        step_logits = logits[prefix_len - 1 + i]
+        step_logits = logits[i]
         verify_probs = F.softmax(step_logits.float() / temperature, dim=-1)
         verify_probs = top_p_filter(verify_probs, top_p)
 
@@ -117,12 +166,12 @@ def verify_and_accept(
             accepted.append(token_id)
             continue
 
-        # rejection: resample from the residual distribution and stop this round
-        draft_dist = torch.zeros_like(verify_probs)
-        draft_dist[token_id] = (
-            p_draft  # only the sampled token's mass is known/relevant
-        )
-        residual = torch.clamp(verify_probs - draft_dist, min=0.0)
+        # rejection: resample from the residual distribution and stop this round.
+        # Uses the draft's full filtered distribution at this position (not just
+        # p_draft(token_id)) -- subtracting only the sampled token's mass would
+        # leave every other token's verifier probability untouched, overstating
+        # residual mass on tokens the draft actually assigned real probability to.
+        residual = torch.clamp(verify_probs - draft_dists[i], min=0.0)
         if residual.sum() <= 0:
             correction = int(torch.argmax(verify_probs).item())
         else:
@@ -133,10 +182,12 @@ def verify_and_accept(
             bonus_token=correction,
             num_proposed=gamma,
             num_accepted=len(accepted),
-        )
+            entropy_trace=entropy_trace,
+            requested_gamma=requested_gamma,
+        ), cache
 
     # all gamma tokens accepted -- sample a free bonus token from the verifier
-    bonus_logits = logits[prefix_len - 1 + gamma]
+    bonus_logits = logits[gamma]
     bonus_probs = top_p_filter(
         F.softmax(bonus_logits.float() / temperature, dim=-1), top_p
     )
@@ -146,4 +197,5 @@ def verify_and_accept(
         bonus_token=bonus_token,
         num_proposed=gamma,
         num_accepted=len(accepted),
-    )
+        entropy_trace=entropy_trace,
+    ), cache
