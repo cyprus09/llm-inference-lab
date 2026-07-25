@@ -35,6 +35,8 @@ def warmup(model, tokenizer, device, n_tokens: int = 8):
         torch.mps.synchronize()
     elif device.type == "cuda":
         torch.cuda.synchronize()
+    if device.type == "mps":
+        torch.mps.empty_cache()   
 
 
 def load_and_warm(
@@ -45,6 +47,8 @@ def load_and_warm(
     model, tokenizer, device = load_model(
         model_name, dtype=dtype, attn_implementation=attn_implementation
     )
+    if device.type == "mps":
+        torch.mps.empty_cache()    
     warmup(model, tokenizer, device)
     return model, tokenizer, device
 
