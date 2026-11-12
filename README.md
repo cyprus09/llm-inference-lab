@@ -1,4 +1,4 @@
-# llm-inference-lab# LLM Inference Lab
+# LLM Inference Lab
 
 Experiments and reference implementations for understanding and improving
 autoregressive language-model inference.
